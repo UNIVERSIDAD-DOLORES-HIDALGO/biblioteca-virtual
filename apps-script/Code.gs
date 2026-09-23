@@ -6,8 +6,9 @@
  *    Google pide correo y contraseña institucional antes de llegar aquí; nadie de fuera entra.
  *  - Los PDFs viven en Drive (carpeta RAIZ, una subcarpeta por categoría) compartidos solo con
  *    el dominio. Aunque alguien copie un enlace, Drive vuelve a pedir la cuenta @udhi.edu.mx.
- *  - Para agregar un libro: soltar el PDF en la subcarpeta de su categoría y correr
- *    compartirConDominio(). El nombre del archivo es el título que se muestra.
+ *  - Para agregar un libro: soltar el PDF en la subcarpeta de su categoría. El nombre del
+ *    archivo es el título. Al reconstruir el catálogo (cada ≤50 min) el script lo deja solo para
+ *    el dominio y sin descarga; para verlo al momento, correr refrescar().
  *  - Cada apertura queda en la hoja de accesos (id en la propiedad LOG_ID).
  *
  * Requiere el servicio avanzado "Drive API" (v3), declarado en appsscript.json.
@@ -83,10 +84,14 @@ function catalogo_() {
     "'" + raiz_() + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
     'id,name');
   carpetas.sort((a, b) => a.name.localeCompare(b.name, 'es'));
+  // Protege al vuelo los PDFs nuevos (sin marca), hasta 40 por reconstrucción para no alentar la
+  // página; los que excedan se muestran igual y se protegen en la siguiente (o con compartirConDominio).
+  let presupuesto = 40;
   const cat = carpetas.map(f => ({
     c: f.name,
     l: listar_("'" + f.id + "' in parents and mimeType='application/pdf' and trashed=false",
-               'id,name,thumbnailLink')
+               'id,name,thumbnailLink,appProperties')
+      .map(x => { if (!protegido_(x) && presupuesto-- > 0) proteger_(x.id); return x; })
       .map(x => [x.id, x.name.replace(/\.pdf$/i, ''),
                  (x.thumbnailLink || '').replace(/=s\d+$/, '=s400')])
       .sort((a, b) => a[1].localeCompare(b[1], 'es')),
@@ -97,6 +102,28 @@ function catalogo_() {
   trozos.cat_n = String(i);
   cache.putAll(trozos, CACHE_SEG);
   return cat;
+}
+
+/*
+ * En unidades compartidas files.list no trae los permisos de cada archivo, así que no se puede
+ * preguntar "¿ya está compartido?". Al protegerlo se le pone la marca appProperties.bv = 'ok'.
+ */
+function protegido_(x) {
+  return !!(x.appProperties && x.appProperties.bv === 'ok');
+}
+
+/** Solo lectura para @udhi.edu.mx, no descubrible, sin descargar/imprimir/copiar. */
+function proteger_(id) {
+  try {
+    Drive.Permissions.create({type: 'domain', domain: DOMINIO, role: 'reader', allowFileDiscovery: false},
+      id, {sendNotificationEmail: false, supportsAllDrives: true});
+    Drive.Files.update({copyRequiresWriterPermission: true, appProperties: {bv: 'ok'}}, id, null,
+      {supportsAllDrives: true});
+    return true;
+  } catch (e) {
+    console.error('proteger_ ' + id + ': ' + e);
+    return false;
+  }
 }
 
 function registrar_(correo, accion, categoria, titulo) {
@@ -127,38 +154,25 @@ function configurar() {
 }
 
 /**
- * Deja cada PDF visible solo para @udhi.edu.mx y sin descarga/impresión para lectores.
+ * Protege todos los PDFs que aún no tengan la marca (útil tras una carga masiva).
  * Reanudable: si se corta por tiempo, volver a correrla sigue donde iba.
  */
 function compartirConDominio() {
   const inicio = Date.now();
   const raiz = raiz_();
   const carpetas = listar_("'" + raiz + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", 'id');
-  let hechos = 0, pendientes = 0;
+  let hechos = 0, fallos = 0, pendientes = 0;
   [raiz].concat(carpetas.map(f => f.id)).forEach(fid => {
-    const archivos = listar_("'" + fid + "' in parents and trashed=false",
-      'id,mimeType,copyRequiresWriterPermission,permissions(type,domain,role,allowFileDiscovery)');
-    archivos.forEach(a => {
-      if (Date.now() - inicio > 5 * 60 * 1000) { pendientes++; return; }
-      const perms = a.permissions || [];
-      let tieneDominio = perms.some(x => x.type === 'domain' && x.domain === DOMINIO);
-      if (perms.some(x => x.type === 'anyone')) { // público: se cierra y se vuelve a abrir solo al dominio
-        DriveApp.getFileById(a.id).setSharing(DriveApp.Access.PRIVATE, DriveApp.Permission.NONE);
-        tieneDominio = false;
-      }
-      if (!tieneDominio) {
-        Drive.Permissions.create({type: 'domain', domain: DOMINIO, role: 'reader', allowFileDiscovery: false},
-          a.id, {sendNotificationEmail: false, supportsAllDrives: true});
-      }
-      if (a.mimeType === 'application/pdf' && !a.copyRequiresWriterPermission) {
-        Drive.Files.update({copyRequiresWriterPermission: true}, a.id, null, {supportsAllDrives: true});
-      }
-      hechos++;
-    });
+    listar_("'" + fid + "' in parents and mimeType='application/pdf' and trashed=false and " +
+            "not appProperties has { key='bv' and value='ok' }", 'id')
+      .forEach(a => {
+        if (Date.now() - inicio > 5 * 60 * 1000) { pendientes++; return; }
+        if (proteger_(a.id)) hechos++; else fallos++;
+      });
   });
   CacheService.getScriptCache().remove('cat_n');
-  console.log('Revisados: ' + hechos + ' · Pendientes por tiempo: ' + pendientes +
-    (pendientes ? ' → vuelve a correrla' : ' → listo'));
+  console.log('Protegidos ahora: ' + hechos + ' · Fallos: ' + fallos + ' · Pendientes por tiempo: ' +
+    pendientes + (pendientes || fallos ? ' → vuelve a correrla' : ' → todo protegido'));
 }
 
 /** Borra el caché para que un PDF recién agregado aparezca de inmediato. */
